@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-ruta = r'pdi1-2026\TP1\Images\Imagen_con_detalles_escondidos.tif'
+ruta = r'G:\Academicos\FCEIA\CUARTO CUATRIMESTRE\PDI1\pdi1-2026\TP1\Images\Imagen_con_detalles_escondidos.tif'
 img = cv2.imread(ruta, cv2.IMREAD_GRAYSCALE)
 
 
