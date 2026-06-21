@@ -1,0 +1,323 @@
+import cv2
+import numpy as np
+import glob, os, sys
+from collections import Counter
+
+# ── Parámetros ────────────────────────────────────────────────────────────────
+RED_LO1 = np.array([0,   100, 60]);  RED_HI1 = np.array([10,  255, 255])
+RED_LO2 = np.array([165, 100, 60]);  RED_HI2 = np.array([180, 255, 255])
+
+DICE_AREA_MIN = 800;   DICE_AREA_MAX = 20000;  DICE_AR_MAX = 2.5
+N_DICE = 5;            MAX_MOVE = 12;           N_STABLE = 10
+
+DOT_AREA_MIN_FRAC = 0.005;  DOT_AREA_MAX_FRAC = 0.18
+DOT_FILL_MIN = 0.65;        DOT_AR_MAX = 1.8
+
+ANNOTATE_EXTRA_FRAMES = 90
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+COLORS = [(0,255,0),(0,220,255),(255,100,0),(255,0,255),(100,200,255)]
+
+
+# ── Detectar dados: devuelve bboxes + máscaras ────────────────────────────────
+def detect_dice(frame):
+    hsv      = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask_raw = cv2.bitwise_or(cv2.inRange(hsv, RED_LO1, RED_HI1),
+                               cv2.inRange(hsv, RED_LO2, RED_HI2))
+    k_close  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    k_open   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask     = cv2.morphologyEx(mask_raw, cv2.MORPH_CLOSE, k_close, iterations=2)
+    mask     = cv2.morphologyEx(mask,     cv2.MORPH_OPEN,  k_open,  iterations=1)
+    mask_morfo = mask.copy()
+
+    boxes = []
+    for c in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        x, y, w, h = cv2.boundingRect(c)
+        area = w * h
+        ar   = max(w, h) / (min(w, h) + 1e-5)
+        if DICE_AREA_MIN <= area <= DICE_AREA_MAX and ar < DICE_AR_MAX:
+            boxes.append((x, y, w, h))
+
+    return sorted(boxes, key=lambda b: b[0]), mask_raw, mask_morfo
+
+
+# ── Contar puntos de un dado (crop BGR) ───────────────────────────────────────
+def count_dots(crop):
+    if crop is None or crop.size == 0:
+        return 0, None, None
+    gray      = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    blur      = cv2.GaussianBlur(gray, (5, 5), 0)
+    ref_area  = crop.shape[0] * crop.shape[1]
+    thresh_v  = max(130, int(np.percentile(blur, 95) * 0.65))
+    _, thresh = cv2.threshold(blur, thresh_v, 255, cv2.THRESH_BINARY)
+
+    retval, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+    DOT_MIN = ref_area * DOT_AREA_MIN_FRAC
+    DOT_MAX = ref_area * DOT_AREA_MAX_FRAC
+
+    dots = 0
+    cc_vis = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+    palette = [(255,50,50),(50,255,50),(50,50,255),(255,255,50),(255,50,255),(50,255,255)]
+    for i in range(1, retval):
+        area = stats[i, cv2.CC_STAT_AREA]
+        cw   = stats[i, cv2.CC_STAT_WIDTH]
+        ch   = stats[i, cv2.CC_STAT_HEIGHT]
+        if not (DOT_MIN <= area <= DOT_MAX):
+            continue
+        fill = area / (cw * ch + 1e-5)
+        ar   = max(cw, ch) / (min(cw, ch) + 1e-5)
+        if fill > DOT_FILL_MIN and ar < DOT_AR_MAX:
+            cc_vis[labels == i] = palette[dots % len(palette)]
+            cx, cy = int(centroids[i][0]), int(centroids[i][1])
+            cv2.circle(cc_vis, (cx, cy), 3, (255, 255, 255), -1)
+            dots += 1
+
+    return dots, thresh, cc_vis
+
+
+# ── Matching de cajas entre frames ────────────────────────────────────────────
+def match_boxes(prev, curr):
+    if len(prev) != N_DICE or len(curr) != N_DICE:
+        return curr
+    pc = np.array([(x+w/2, y+h/2) for x,y,w,h in prev], dtype=np.float32)
+    cc = np.array([(x+w/2, y+h/2) for x,y,w,h in curr], dtype=np.float32)
+    used, matched = [False]*N_DICE, [None]*N_DICE
+    for i in range(N_DICE):
+        best_j, best_d = -1, float('inf')
+        for j in range(N_DICE):
+            if not used[j]:
+                d = np.linalg.norm(pc[i] - cc[j])
+                if d < best_d:
+                    best_d, best_j = d, j
+        matched[i] = curr[best_j]; used[best_j] = True
+    return matched
+
+
+# ── Mostrar y opcionalmente guardar imágenes del pipeline ────────────────────
+def show_pipeline(frame, mask_raw, mask_morfo, boxes, tirada_n,
+                  guardar=False, save_dir=None):
+
+    def mostrar(nombre, img):
+        cv2.imshow(f"Tirada {tirada_n} | {nombre}  [cualquier tecla para continuar]", img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    def guardar_img(nombre, img):
+        if guardar and save_dir:
+            cv2.imwrite(os.path.join(save_dir, nombre), img)
+
+    if guardar and save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    # 1. Frame original con bboxes
+    vis = frame.copy()
+    for i, (x, y, w, h) in enumerate(boxes):
+        cv2.rectangle(vis, (x,y), (x+w,y+h), COLORS[i], 2)
+        cv2.putText(vis, f"D{i+1}", (x+2, y-6), FONT, 0.6, COLORS[i], 2)
+    mostrar("1 - Frame original", vis)
+    guardar_img("1_frame_original.jpg", vis)
+
+    # 2. Máscara HSV cruda
+    m1 = cv2.cvtColor(mask_raw, cv2.COLOR_GRAY2BGR)
+    cv2.putText(m1, "Mascara HSV (inRange)", (8,24), FONT, 0.6, (0,255,255), 2)
+    mostrar("2 - Mascara HSV", m1)
+    guardar_img("2_mascara_hsv.jpg", m1)
+
+    # 3. Máscara post-morfología
+    m2 = cv2.cvtColor(mask_morfo, cv2.COLOR_GRAY2BGR)
+    cv2.putText(m2, "Mascara post-morfologia (CLOSE+OPEN)", (8,24), FONT, 0.6, (0,255,255), 2)
+    mostrar("3 - Mascara morfologia", m2)
+    guardar_img("3_mascara_morfo.jpg", m2)
+
+    # 4-5. ROI y CC por dado + imagen compuesta
+    THUMB_H = 120
+    rois_row, cc_row = [], []
+
+    for i, (x, y, w, h) in enumerate(boxes):
+        crop = frame[y:y+h, x:x+w]
+        dots, thresh, cc_vis = count_dots(crop)
+
+        roi_lbl = crop.copy()
+        cv2.putText(roi_lbl, f"D{i+1} ROI", (2,14), FONT, 0.45, (0,255,255), 1)
+        guardar_img(f"4_D{i+1}_roi.jpg", roi_lbl)
+
+        cv2.putText(cc_vis, f"D{i+1}  puntos={dots}", (2,14), FONT, 0.45, (0,255,255), 1)
+        guardar_img(f"5_D{i+1}_cc.jpg", cc_vis)
+
+        scale = THUMB_H / crop.shape[0]
+        tw    = max(1, int(crop.shape[1] * scale))
+        rois_row.append(cv2.resize(roi_lbl, (tw, THUMB_H)))
+        cc_row.append(cv2.resize(cc_vis,   (tw, THUMB_H)))
+
+    # Imagen compuesta con todos los dados
+    gap = np.zeros((THUMB_H, 4, 3), dtype=np.uint8)
+    def hstack(imgs):
+        r = imgs[0]
+        for im in imgs[1:]: r = np.hstack([r, gap, im])
+        return r
+
+    row_r = hstack(rois_row)
+    row_c = hstack(cc_row)
+    W_max = max(row_r.shape[1], row_c.shape[1])
+
+    def pad(img, W):
+        d = W - img.shape[1]
+        return np.hstack([img, np.zeros((img.shape[0], d, 3), dtype=np.uint8)]) if d > 0 else img
+
+    row_r = pad(row_r, W_max);  row_c = pad(row_c, W_max)
+
+    lbl1 = np.zeros((20, W_max, 3), dtype=np.uint8)
+    lbl2 = np.zeros((20, W_max, 3), dtype=np.uint8)
+    cv2.putText(lbl1, "ROIs originales", (4,14), FONT, 0.45, (200,200,200), 1)
+    cv2.putText(lbl2, "Umbralizada + Componentes Conectadas", (4,14), FONT, 0.45, (200,200,200), 1)
+
+    compuesto = np.vstack([lbl1, row_r, lbl2, row_c])
+    mostrar("4 - Compuesto dados", compuesto)
+    guardar_img("6_compuesto_dados.jpg", compuesto)
+
+    if guardar and save_dir:
+        print(f"  Imágenes guardadas en: {save_dir}/")
+
+
+# ── Procesar un video ─────────────────────────────────────────────────────────
+def process_video(video_path, output_path, guardar_imagenes=False):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[ERROR] No se pudo abrir: {video_path}"); return
+
+    W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    FPS = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), FPS, (W, H))
+
+    print(f"\nProcesando: {os.path.basename(video_path)}")
+
+    prev_boxes   = None
+    prev_cents   = None
+    stable_count = 0
+    dot_history  = [[] for _ in range(N_DICE)]
+    tirada_n     = 0
+    annotating   = False
+    annot_end    = -1
+    stable_boxes = None
+    stable_vals  = None
+    pipeline_guardado = False   # solo se guarda en la primera tirada
+    resumen      = []
+    frame_n      = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        out_frame = frame.copy()
+        boxes, mask_raw, mask_morfo = detect_dice(frame)
+
+        if len(boxes) == N_DICE:
+            if prev_boxes is not None:
+                boxes = match_boxes(prev_boxes, boxes)
+            prev_boxes = boxes
+            cents = np.array([(x+w/2, y+h/2) for x,y,w,h in boxes], dtype=np.float32)
+
+            if prev_cents is not None:
+                dists = np.linalg.norm(cents - prev_cents, axis=1)
+                if np.all(dists < MAX_MOVE):
+                    stable_count += 1
+                    for i, (x, y, w, h) in enumerate(boxes):
+                        d, _, _ = count_dots(frame[y:y+h, x:x+w])
+                        dot_history[i].append(d)
+                else:
+                    stable_count = 0
+                    dot_history  = [[] for _ in range(N_DICE)]
+                    if annotating:
+                        annotating = False; prev_boxes = None
+
+            prev_cents = cents
+
+            if stable_count >= N_STABLE and not annotating:
+                values = [Counter(h).most_common(1)[0][0] if h else 0
+                          for h in dot_history]
+
+                tirada_n   += 1
+                stable_boxes = boxes
+                stable_vals  = values
+                annotating   = True
+                annot_end    = frame_n + ANNOTATE_EXTRA_FRAMES
+                resumen.append({"n": tirada_n, "t": frame_n/FPS, "vals": values})
+
+                # ── Consola ───────────────────────────────────────────────────
+                print(f"\n  TIRADA {tirada_n}  |  t={frame_n/FPS:.2f}s")
+                for i, v in enumerate(values):
+                    print(f"    D{i+1}: {v} puntos")
+                print(f"    SUMA: {sum(values)}")
+
+                # ── Mostrar pipeline (todas las tiradas) / guardar (solo primera) ──
+                save_dir = os.path.splitext(output_path)[0] + "_pipeline"
+                show_pipeline(frame, mask_raw, mask_morfo, stable_boxes,
+                              tirada_n,
+                              guardar=guardar_imagenes and not pipeline_guardado,
+                              save_dir=save_dir)
+                pipeline_guardado = True
+
+                stable_count = 0
+                dot_history  = [[] for _ in range(N_DICE)]
+                prev_boxes   = None
+                prev_cents   = None
+
+        else:
+            stable_count = 0
+            dot_history  = [[] for _ in range(N_DICE)]
+            prev_cents   = None
+            if not annotating:
+                prev_boxes = None
+
+        # Anotaciones en video
+        if annotating:
+            if frame_n <= annot_end:
+                for i, ((x,y,w,h), val) in enumerate(zip(stable_boxes, stable_vals)):
+                    col = COLORS[i]
+                    cv2.rectangle(out_frame, (x,y), (x+w,y+h), col, 2)
+                    (tw, th), _ = cv2.getTextSize(f"D{i+1}-{val}", FONT, 0.6, 2)
+                    cv2.rectangle(out_frame, (x, y-th-6), (x+tw+4, y), col, -1)
+                    cv2.putText(out_frame, f"D{i+1}-{val}", (x+2,y-4), FONT, 0.6, (0,0,0), 2)
+                banner = f"TIRADA {tirada_n}  |  " + "  ".join(f"D{i+1}:{v}" for i,v in enumerate(stable_vals)) + f"  |  SUMA={sum(stable_vals)}"
+                cv2.rectangle(out_frame, (0,0), (W,40), (20,20,20), -1)
+                cv2.putText(out_frame, banner, (8,28), FONT, 0.65, (255,255,255), 2)
+            else:
+                annotating = False
+
+        out.write(out_frame)
+        frame_n += 1
+
+    cap.release()
+    out.release()
+
+    # ── Resumen final ─────────────────────────────────────────────────────────
+    print(f"\n{'─'*50}")
+    print(f"  RESUMEN: {len(resumen)} tirada(s) detectadas")
+    print(f"  {'#':<4} {'t(s)':>6}  D1  D2  D3  D4  D5  SUMA")
+    print(f"{'─'*50}")
+    for r in resumen:
+        vals_str = "  ".join(f"{v:>2}" for v in r["vals"])
+        print(f"  {r['n']:<4} {r['t']:>6.2f}  {vals_str}  {sum(r['vals']):>4}")
+    print(f"{'─'*50}")
+    print(f"  Video guardado: {output_path}\n")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    video_files = sorted(glob.glob(r'TP3_PDI\videos\*.mp4'))
+    if not video_files:
+        video_files = sorted(glob.glob('tirada_*.mp4'))
+    if not video_files:
+        video_files = sys.argv[1:]
+    if not video_files:
+        print("[ERROR] No se encontraron videos. Colocar en 'videos/' o pasar como argumento.")
+        sys.exit(1)
+
+    guardar_imagenes = input("¿Guardar imágenes del pipeline? (s/n): ").strip().lower() == 's'
+
+    for vpath in video_files:
+        base = os.path.splitext(os.path.basename(vpath))[0]
+        process_video(vpath, f"{base}_resultado.mp4", guardar_imagenes)
+
+    print("Procesamiento finalizado.")
