@@ -133,6 +133,12 @@ for video_path in videos:
                     
                     _, roi_bin = cv2.threshold(roi_tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                     
+                    # Imágenes para el informe
+                    #if tirada_nro == 1 and k == 1:
+                        #cv2.imwrite("TP3/resultados/1_dado_gris_traslucido.jpg", roi_dado)
+                        #cv2.imwrite("TP3/resultados/2_dado_tophat.jpg", roi_tophat)
+                        #cv2.imwrite("TP3/resultados/3_dado_otsu_limpio.jpg", roi_bin)
+
                     rois_bgr_list.append(roi_dado_bgr)
                     rois_bin_list.append(roi_bin)
                     
@@ -205,9 +211,7 @@ for video_path in videos:
                 plt.axis('off')
                 
                 plt.tight_layout()
-                plt.show(block=False)
-                plt.pause(2.5) 
-                plt.close() # Cierra la ventana para que la próxima tirada abra una limpia
+                plt.show(block=True)
                 
                 tirada_nro += 1
                 
