@@ -1,323 +1,240 @@
 import cv2
 import numpy as np
-import glob, os, sys
-from collections import Counter
+import matplotlib.pyplot as plt
+import glob
+import os
 
-# ── Parámetros ────────────────────────────────────────────────────────────────
-RED_LO1 = np.array([0,   100, 60]);  RED_HI1 = np.array([10,  255, 255])
-RED_LO2 = np.array([165, 100, 60]);  RED_HI2 = np.array([180, 255, 255])
+# ===============================================================================
+# Función imshow de la cátedra
+# ===============================================================================
+def imshow(img, new_fig=True, title=None, color_img=False, blocking=False, colorbar=False, ticks=False):
+    if new_fig:
+        plt.figure()
+    if color_img:
+        plt.imshow(img)
+    else:
+        plt.imshow(img, cmap='gray')
+    plt.title(title)
+    if not ticks:
+        plt.xticks([]), plt.yticks([])
+    if colorbar:
+        plt.colorbar()
+    if new_fig:        
+        plt.show(block=blocking)
 
-DICE_AREA_MIN = 800;   DICE_AREA_MAX = 20000;  DICE_AR_MAX = 2.5
-N_DICE = 5;            MAX_MOVE = 12;           N_STABLE = 10
+# ===============================================================================
+# --- Problema - Cinco dados ----------------------------------------------------
+# ===============================================================================
 
-DOT_AREA_MIN_FRAC = 0.005;  DOT_AREA_MAX_FRAC = 0.18
-DOT_FILL_MIN = 0.65;        DOT_AR_MAX = 1.8
+videos = sorted(glob.glob('TP3/videos/tirada_*.mp4'))
+if not videos:
+    videos = sorted(glob.glob('tirada_*.mp4'))
+    
+if not videos:
+    print("No se encontraron videos con el formato 'tirada_<id>.mp4'.")
 
-ANNOTATE_EXTRA_FRAMES = 90
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-COLORS = [(0,255,0),(0,220,255),(255,100,0),(255,0,255),(100,200,255)]
+output_dir = os.path.join('TP3', 'resultados')
+os.makedirs(output_dir, exist_ok=True)
 
+tirada_nro = 1  
 
-# ── Detectar dados: devuelve bboxes + máscaras ────────────────────────────────
-def detect_dice(frame):
-    hsv      = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask_raw = cv2.bitwise_or(cv2.inRange(hsv, RED_LO1, RED_HI1),
-                               cv2.inRange(hsv, RED_LO2, RED_HI2))
-    k_close  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    k_open   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask     = cv2.morphologyEx(mask_raw, cv2.MORPH_CLOSE, k_close, iterations=2)
-    mask     = cv2.morphologyEx(mask,     cv2.MORPH_OPEN,  k_open,  iterations=1)
-    mask_morfo = mask.copy()
-
-    boxes = []
-    for c in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
-        x, y, w, h = cv2.boundingRect(c)
-        area = w * h
-        ar   = max(w, h) / (min(w, h) + 1e-5)
-        if DICE_AREA_MIN <= area <= DICE_AREA_MAX and ar < DICE_AR_MAX:
-            boxes.append((x, y, w, h))
-
-    return sorted(boxes, key=lambda b: b[0]), mask_raw, mask_morfo
-
-
-# ── Contar puntos de un dado (crop BGR) ───────────────────────────────────────
-def count_dots(crop):
-    if crop is None or crop.size == 0:
-        return 0, None, None
-    gray      = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    blur      = cv2.GaussianBlur(gray, (5, 5), 0)
-    ref_area  = crop.shape[0] * crop.shape[1]
-    thresh_v  = max(130, int(np.percentile(blur, 95) * 0.65))
-    _, thresh = cv2.threshold(blur, thresh_v, 255, cv2.THRESH_BINARY)
-
-    retval, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
-    DOT_MIN = ref_area * DOT_AREA_MIN_FRAC
-    DOT_MAX = ref_area * DOT_AREA_MAX_FRAC
-
-    dots = 0
-    cc_vis = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-    palette = [(255,50,50),(50,255,50),(50,50,255),(255,255,50),(255,50,255),(50,255,255)]
-    for i in range(1, retval):
-        area = stats[i, cv2.CC_STAT_AREA]
-        cw   = stats[i, cv2.CC_STAT_WIDTH]
-        ch   = stats[i, cv2.CC_STAT_HEIGHT]
-        if not (DOT_MIN <= area <= DOT_MAX):
-            continue
-        fill = area / (cw * ch + 1e-5)
-        ar   = max(cw, ch) / (min(cw, ch) + 1e-5)
-        if fill > DOT_FILL_MIN and ar < DOT_AR_MAX:
-            cc_vis[labels == i] = palette[dots % len(palette)]
-            cx, cy = int(centroids[i][0]), int(centroids[i][1])
-            cv2.circle(cc_vis, (cx, cy), 3, (255, 255, 255), -1)
-            dots += 1
-
-    return dots, thresh, cc_vis
-
-
-# ── Matching de cajas entre frames ────────────────────────────────────────────
-def match_boxes(prev, curr):
-    if len(prev) != N_DICE or len(curr) != N_DICE:
-        return curr
-    pc = np.array([(x+w/2, y+h/2) for x,y,w,h in prev], dtype=np.float32)
-    cc = np.array([(x+w/2, y+h/2) for x,y,w,h in curr], dtype=np.float32)
-    used, matched = [False]*N_DICE, [None]*N_DICE
-    for i in range(N_DICE):
-        best_j, best_d = -1, float('inf')
-        for j in range(N_DICE):
-            if not used[j]:
-                d = np.linalg.norm(pc[i] - cc[j])
-                if d < best_d:
-                    best_d, best_j = d, j
-        matched[i] = curr[best_j]; used[best_j] = True
-    return matched
-
-
-# ── Mostrar y opcionalmente guardar imágenes del pipeline ────────────────────
-def show_pipeline(frame, mask_raw, mask_morfo, boxes, tirada_n,
-                  guardar=False, save_dir=None):
-
-    def mostrar(nombre, img):
-        cv2.imshow(f"Tirada {tirada_n} | {nombre}  [cualquier tecla para continuar]", img)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
-    def guardar_img(nombre, img):
-        if guardar and save_dir:
-            cv2.imwrite(os.path.join(save_dir, nombre), img)
-
-    if guardar and save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-
-    # 1. Frame original con bboxes
-    vis = frame.copy()
-    for i, (x, y, w, h) in enumerate(boxes):
-        cv2.rectangle(vis, (x,y), (x+w,y+h), COLORS[i], 2)
-        cv2.putText(vis, f"D{i+1}", (x+2, y-6), FONT, 0.6, COLORS[i], 2)
-    mostrar("1 - Frame original", vis)
-    guardar_img("1_frame_original.jpg", vis)
-
-    # 2. Máscara HSV cruda
-    m1 = cv2.cvtColor(mask_raw, cv2.COLOR_GRAY2BGR)
-    cv2.putText(m1, "Mascara HSV (inRange)", (8,24), FONT, 0.6, (0,255,255), 2)
-    mostrar("2 - Mascara HSV", m1)
-    guardar_img("2_mascara_hsv.jpg", m1)
-
-    # 3. Máscara post-morfología
-    m2 = cv2.cvtColor(mask_morfo, cv2.COLOR_GRAY2BGR)
-    cv2.putText(m2, "Mascara post-morfologia (CLOSE+OPEN)", (8,24), FONT, 0.6, (0,255,255), 2)
-    mostrar("3 - Mascara morfologia", m2)
-    guardar_img("3_mascara_morfo.jpg", m2)
-
-    # 4-5. ROI y CC por dado + imagen compuesta
-    THUMB_H = 120
-    rois_row, cc_row = [], []
-
-    for i, (x, y, w, h) in enumerate(boxes):
-        crop = frame[y:y+h, x:x+w]
-        dots, thresh, cc_vis = count_dots(crop)
-
-        roi_lbl = crop.copy()
-        cv2.putText(roi_lbl, f"D{i+1} ROI", (2,14), FONT, 0.45, (0,255,255), 1)
-        guardar_img(f"4_D{i+1}_roi.jpg", roi_lbl)
-
-        cv2.putText(cc_vis, f"D{i+1}  puntos={dots}", (2,14), FONT, 0.45, (0,255,255), 1)
-        guardar_img(f"5_D{i+1}_cc.jpg", cc_vis)
-
-        scale = THUMB_H / crop.shape[0]
-        tw    = max(1, int(crop.shape[1] * scale))
-        rois_row.append(cv2.resize(roi_lbl, (tw, THUMB_H)))
-        cc_row.append(cv2.resize(cc_vis,   (tw, THUMB_H)))
-
-    # Imagen compuesta con todos los dados
-    gap = np.zeros((THUMB_H, 4, 3), dtype=np.uint8)
-    def hstack(imgs):
-        r = imgs[0]
-        for im in imgs[1:]: r = np.hstack([r, gap, im])
-        return r
-
-    row_r = hstack(rois_row)
-    row_c = hstack(cc_row)
-    W_max = max(row_r.shape[1], row_c.shape[1])
-
-    def pad(img, W):
-        d = W - img.shape[1]
-        return np.hstack([img, np.zeros((img.shape[0], d, 3), dtype=np.uint8)]) if d > 0 else img
-
-    row_r = pad(row_r, W_max);  row_c = pad(row_c, W_max)
-
-    lbl1 = np.zeros((20, W_max, 3), dtype=np.uint8)
-    lbl2 = np.zeros((20, W_max, 3), dtype=np.uint8)
-    cv2.putText(lbl1, "ROIs originales", (4,14), FONT, 0.45, (200,200,200), 1)
-    cv2.putText(lbl2, "Umbralizada + Componentes Conectadas", (4,14), FONT, 0.45, (200,200,200), 1)
-
-    compuesto = np.vstack([lbl1, row_r, lbl2, row_c])
-    mostrar("4 - Compuesto dados", compuesto)
-    guardar_img("6_compuesto_dados.jpg", compuesto)
-
-    if guardar and save_dir:
-        print(f"  Imágenes guardadas en: {save_dir}/")
-
-
-# ── Procesar un video ─────────────────────────────────────────────────────────
-def process_video(video_path, output_path, guardar_imagenes=False):
+for video_path in videos:
+    video_name = os.path.basename(video_path)
+    print(f"\n{'='*50}\nProcesando: {video_name}\n{'='*50}")
+    
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"[ERROR] No se pudo abrir: {video_path}"); return
-
-    W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    FPS = int(cap.get(cv2.CAP_PROP_FPS)) or 30
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), FPS, (W, H))
-
-    print(f"\nProcesando: {os.path.basename(video_path)}")
-
-    prev_boxes   = None
-    prev_cents   = None
-    stable_count = 0
-    dot_history  = [[] for _ in range(N_DICE)]
-    tirada_n     = 0
-    annotating   = False
-    annot_end    = -1
-    stable_boxes = None
-    stable_vals  = None
-    pipeline_guardado = False   # solo se guarda en la primera tirada
-    resumen      = []
-    frame_n      = 0
-
+        print(f"No se pudo abrir el video {video_name}.")
+        continue
+        
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    
+    nombre_salida = os.path.join(output_dir, f'Resultado_{video_name}')
+    out = cv2.VideoWriter(nombre_salida, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    
+    # Variables de estado de la máquina
+    estado = 'BUSCANDO'
+    centroides_anteriores = None
+    contador_frames_quietos = 0
+    
+    dados_reposo = [] 
+    resultados_tirada = [] 
+    
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
+            
+        frame_result = frame.copy()
+        frame_gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # --- 1) SEGMENTACIÓN DE LOS DADOS ---
+        mask_verde = cv2.inRange(frame_hsv, np.array([35, 40, 40]), np.array([85, 255, 255]))
+        mask_sin_verde = cv2.bitwise_not(mask_verde)
 
-        out_frame = frame.copy()
-        boxes, mask_raw, mask_morfo = detect_dice(frame)
+        mask_rojo1 = cv2.inRange(frame_hsv, np.array([0,  100, 60]), np.array([10,  255, 255]))
+        mask_rojo2 = cv2.inRange(frame_hsv, np.array([165, 100, 60]), np.array([180, 255, 255]))
+        mask_rojo = cv2.bitwise_or(mask_rojo1, mask_rojo2)
+        
+        mask_dados = cv2.bitwise_and(mask_rojo, mask_sin_verde)
+        
+        kernel_c = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        mask_dados = cv2.morphologyEx(mask_dados, cv2.MORPH_CLOSE, kernel_c)
+        
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_dados, connectivity=8, ltype=cv2.CV_32S)
+        
+        dados_actuales = []
+        for i in range(1, num_labels):
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            area = stats[i, cv2.CC_STAT_AREA]
+            aspect_ratio = float(w) / h
+            
+            if 800 < area < 20000 and 0.5 < aspect_ratio < 1.8:
+                dados_actuales.append({'bbox': (x, y, w, h), 'centroide': centroids[i]})
 
-        if len(boxes) == N_DICE:
-            if prev_boxes is not None:
-                boxes = match_boxes(prev_boxes, boxes)
-            prev_boxes = boxes
-            cents = np.array([(x+w/2, y+h/2) for x,y,w,h in boxes], dtype=np.float32)
-
-            if prev_cents is not None:
-                dists = np.linalg.norm(cents - prev_cents, axis=1)
-                if np.all(dists < MAX_MOVE):
-                    stable_count += 1
-                    for i, (x, y, w, h) in enumerate(boxes):
-                        d, _, _ = count_dots(frame[y:y+h, x:x+w])
-                        dot_history[i].append(d)
+        # --- 2) LÓGICA DE MOVIMIENTO ---
+        if len(dados_actuales) == 5:
+            dados_actuales = sorted(dados_actuales, key=lambda d: d['centroide'][0])
+            centroides_actuales = np.array([d['centroide'] for d in dados_actuales])
+            
+            if centroides_anteriores is not None:
+                distancias = np.sqrt(np.sum((centroides_actuales - centroides_anteriores)**2, axis=1))
+                if np.all(distancias < 5.0): 
+                    contador_frames_quietos += 1
                 else:
-                    stable_count = 0
-                    dot_history  = [[] for _ in range(N_DICE)]
-                    if annotating:
-                        annotating = False; prev_boxes = None
+                    contador_frames_quietos = 0
+                    estado = 'BUSCANDO' 
+                    
+            centroides_anteriores = centroides_actuales
+            
+            # --- 3) TRANSICIÓN AL REPOSO Y CÁLCULO DE PUNTOS ---
+            if contador_frames_quietos > 15 and estado == 'BUSCANDO':
+                estado = 'REPOSO'
+                dados_reposo = dados_actuales
+                
+                resultados_tirada = []
+                rois_bgr_list = []
+                rois_bin_list = []
+                
+                for k in range(5):
+                    x, y, w, h = dados_reposo[k]['bbox']
+                    roi_dado_bgr = frame[y:y+h, x:x+w]
+                    roi_dado = frame_gris[y:y+h, x:x+w]
+                    
+                    k_size = max(3, int(min(w, h) * 0.20)) 
+                    kernel_tophat = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+                    roi_tophat = cv2.morphologyEx(roi_dado, cv2.MORPH_TOPHAT, kernel_tophat)
+                    
+                    _, roi_bin = cv2.threshold(roi_tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    
+                    rois_bgr_list.append(roi_dado_bgr)
+                    rois_bin_list.append(roi_bin)
+                    
+                    c_num, c_labels, c_stats, _ = cv2.connectedComponentsWithStats(roi_bin, connectivity=8, ltype=cv2.CV_32S)
+                    
+                    puntos_detectados = 0
+                    area_dado = w * h
+                    
+                    for j in range(1, c_num):
+                        c_w = c_stats[j, cv2.CC_STAT_WIDTH]
+                        c_h = c_stats[j, cv2.CC_STAT_HEIGHT]
+                        c_area = c_stats[j, cv2.CC_STAT_AREA]
+                        c_ar = float(c_w) / c_h
+                        
+                        # FIX: Cota inferior subida a 0.015 para descartar reflejos del flash
+                        if (area_dado * 0.015) < c_area < (area_dado * 0.15) and 0.4 < c_ar < 2.5:
+                            puntos_detectados += 1
+                            
+                    resultados_tirada.append(puntos_detectados)
 
-            prev_cents = cents
+                # ===============================================================
+                # PASO 5: REPORTE POR CONSOLA Y CUMPLIMIENTO DEL AVISO
+                # ===============================================================
+                
+                # A. Reporte por consola ordenado
+                tiempo_seg = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                print(f"\n  TIRADA {tirada_nro}  |  t={tiempo_seg:.2f}s")
+                for i, puntos in enumerate(resultados_tirada):
+                    print(f"    Dado {i+1}: {puntos} puntos")
+                print(f"    SUMA TOTAL: {sum(resultados_tirada)}\n")
 
-            if stable_count >= N_STABLE and not annotating:
-                values = [Counter(h).most_common(1)[0][0] if h else 0
-                          for h in dot_history]
+                # Actualizamos frame_result para que la captura lo muestre con las cajas
+                for idx, dado in enumerate(dados_reposo):
+                    x, y, w, h = dado['bbox']
+                    cv2.rectangle(frame_result, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    cv2.putText(frame_result, f"D{idx+1}-{resultados_tirada[idx]}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-                tirada_n   += 1
-                stable_boxes = boxes
-                stable_vals  = values
-                annotating   = True
-                annot_end    = frame_n + ANNOTATE_EXTRA_FRAMES
-                resumen.append({"n": tirada_n, "t": frame_n/FPS, "vals": values})
-
-                # ── Consola ───────────────────────────────────────────────────
-                print(f"\n  TIRADA {tirada_n}  |  t={frame_n/FPS:.2f}s")
-                for i, v in enumerate(values):
-                    print(f"    D{i+1}: {v} puntos")
-                print(f"    SUMA: {sum(values)}")
-
-                # ── Mostrar pipeline (todas las tiradas) / guardar (solo primera) ──
-                save_dir = os.path.splitext(output_path)[0] + "_pipeline"
-                show_pipeline(frame, mask_raw, mask_morfo, stable_boxes,
-                              tirada_n,
-                              guardar=guardar_imagenes and not pipeline_guardado,
-                              save_dir=save_dir)
-                pipeline_guardado = True
-
-                stable_count = 0
-                dot_history  = [[] for _ in range(N_DICE)]
-                prev_boxes   = None
-                prev_cents   = None
-
+                # B. Gráfica de Matplotlib (Se muestra 2.5 segs y sigue el video)
+                plt.figure(figsize=(12, 7))
+                plt.suptitle(f"Tirada {tirada_nro} - Suma Total: {sum(resultados_tirada)}", fontsize=16, fontweight='bold')
+                
+                plt.subplot(2, 2, 1)
+                plt.imshow(cv2.cvtColor(frame_result, cv2.COLOR_BGR2RGB))
+                plt.title("1. Video en reposo (Frame completo)")
+                plt.axis('off')
+                
+                plt.subplot(2, 2, 2)
+                plt.imshow(mask_dados, cmap='gray')
+                plt.title("2. Capa imagen de detección (HSV)")
+                plt.axis('off')
+                
+                plt.subplot(2, 1, 2)
+                dice_visuals = []
+                for i in range(5):
+                    bgr_res = cv2.resize(rois_bgr_list[i], (90, 90))
+                    bin_res = cv2.cvtColor(cv2.resize(rois_bin_list[i], (90, 90)), cv2.COLOR_GRAY2BGR)
+                    
+                    lbl = np.zeros((35, 90, 3), dtype=np.uint8)
+                    cv2.putText(lbl, f"D{i+1}: {resultados_tirada[i]}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    
+                    col = np.vstack([lbl, bgr_res, bin_res])
+                    dice_visuals.append(col)
+                    
+                    if i < 4: 
+                        dice_visuals.append(np.zeros((215, 20, 3), dtype=np.uint8))
+                        
+                final_row = np.hstack(dice_visuals)
+                plt.imshow(cv2.cvtColor(final_row, cv2.COLOR_BGR2RGB))
+                plt.title("3. Dados cropeados con sus resultados (Original y TopHat+Otsu)")
+                plt.axis('off')
+                
+                plt.tight_layout()
+                plt.show(block=False)
+                plt.pause(2.5) 
+                plt.close() # Cierra la ventana para que la próxima tirada abra una limpia
+                
+                tirada_nro += 1
+                
         else:
-            stable_count = 0
-            dot_history  = [[] for _ in range(N_DICE)]
-            prev_cents   = None
-            if not annotating:
-                prev_boxes = None
-
-        # Anotaciones en video
-        if annotating:
-            if frame_n <= annot_end:
-                for i, ((x,y,w,h), val) in enumerate(zip(stable_boxes, stable_vals)):
-                    col = COLORS[i]
-                    cv2.rectangle(out_frame, (x,y), (x+w,y+h), col, 2)
-                    (tw, th), _ = cv2.getTextSize(f"D{i+1}-{val}", FONT, 0.6, 2)
-                    cv2.rectangle(out_frame, (x, y-th-6), (x+tw+4, y), col, -1)
-                    cv2.putText(out_frame, f"D{i+1}-{val}", (x+2,y-4), FONT, 0.6, (0,0,0), 2)
-                banner = f"TIRADA {tirada_n}  |  " + "  ".join(f"D{i+1}:{v}" for i,v in enumerate(stable_vals)) + f"  |  SUMA={sum(stable_vals)}"
-                cv2.rectangle(out_frame, (0,0), (W,40), (20,20,20), -1)
-                cv2.putText(out_frame, banner, (8,28), FONT, 0.65, (255,255,255), 2)
-            else:
-                annotating = False
-
-        out.write(out_frame)
-        frame_n += 1
+            contador_frames_quietos = 0
+            centroides_anteriores = None
+            # No cambiamos el estado acá, para que los recuadros se mantengan hasta que los muevan físicamente.
+            
+        # Actualización de estados si se vuelve a tirar un dado en el mismo video
+        if estado == 'REPOSO':
+            if len(dados_actuales) == 5:
+                centroides_act = np.array([d['centroide'] for d in dados_actuales])
+                centroides_rep = np.array([d['centroide'] for d in dados_reposo])
+                if np.max(np.sqrt(np.sum((centroides_act - centroides_rep)**2, axis=1))) > 20.0:
+                    estado = 'BUSCANDO'
+                    contador_frames_quietos = 0
+            
+            # --- 4) DIBUJO EN PANTALLA CONSTANTE DURANTE EL REPOSO ---
+            for idx, dado in enumerate(dados_reposo):
+                x, y, w, h = dado['bbox']
+                cv2.rectangle(frame_result, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(frame_result, f"D{idx+1}-{resultados_tirada[idx]}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                
+        out.write(frame_result)
 
     cap.release()
     out.release()
+    print(f"Video guardado exitosamente en: {nombre_salida}")
 
-    # ── Resumen final ─────────────────────────────────────────────────────────
-    print(f"\n{'─'*50}")
-    print(f"  RESUMEN: {len(resumen)} tirada(s) detectadas")
-    print(f"  {'#':<4} {'t(s)':>6}  D1  D2  D3  D4  D5  SUMA")
-    print(f"{'─'*50}")
-    for r in resumen:
-        vals_str = "  ".join(f"{v:>2}" for v in r["vals"])
-        print(f"  {r['n']:<4} {r['t']:>6.2f}  {vals_str}  {sum(r['vals']):>4}")
-    print(f"{'─'*50}")
-    print(f"  Video guardado: {output_path}\n")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    video_files = sorted(glob.glob(r'TP3_PDI\videos\*.mp4'))
-    if not video_files:
-        video_files = sorted(glob.glob('tirada_*.mp4'))
-    if not video_files:
-        video_files = sys.argv[1:]
-    if not video_files:
-        print("[ERROR] No se encontraron videos. Colocar en 'videos/' o pasar como argumento.")
-        sys.exit(1)
-
-    guardar_imagenes = input("¿Guardar imágenes del pipeline? (s/n): ").strip().lower() == 's'
-
-    for vpath in video_files:
-        base = os.path.splitext(os.path.basename(vpath))[0]
-        process_video(vpath, f"{base}_resultado.mp4", guardar_imagenes)
-
-    print("Procesamiento finalizado.")
+cv2.destroyAllWindows()
