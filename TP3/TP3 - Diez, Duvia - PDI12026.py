@@ -5,7 +5,7 @@ import glob
 import os
 
 # ===============================================================================
-# Función imshow de la cátedra
+# Función imshow para mostrar imágenes
 # ===============================================================================
 def imshow(img, new_fig=True, title=None, color_img=False, blocking=False, colorbar=False, ticks=False):
     if new_fig:
@@ -22,26 +22,27 @@ def imshow(img, new_fig=True, title=None, color_img=False, blocking=False, color
     if new_fig:        
         plt.show(block=blocking)
 
-# ===============================================================================
-# --- Problema - Cinco dados ----------------------------------------------------
-# ===============================================================================
 
+# Carga de videos
 videos = sorted(glob.glob('TP3/videos/tirada_*.mp4'))
 if not videos:
     videos = sorted(glob.glob('tirada_*.mp4'))
     
 if not videos:
-    print("No se encontraron videos con el formato 'tirada_<id>.mp4'.")
+    print("No se encontraron videos.")
 
+# Creación de la carpeta de salida
 output_dir = os.path.join('TP3', 'resultados')
 os.makedirs(output_dir, exist_ok=True)
 
 tirada_nro = 1  
 
+# Procesamiento de los videos
 for video_path in videos:
     video_name = os.path.basename(video_path)
     print(f"\n{'='*50}\nProcesando: {video_name}\n{'='*50}")
     
+    # Lectura del video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"No se pudo abrir el video {video_name}.")
@@ -62,6 +63,7 @@ for video_path in videos:
     dados_reposo = [] 
     resultados_tirada = [] 
     
+    # Procesamiento de los frames
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -153,30 +155,23 @@ for video_path in videos:
                         c_area = c_stats[j, cv2.CC_STAT_AREA]
                         c_ar = float(c_w) / c_h
                         
-                        # FIX: Cota inferior subida a 0.015 para descartar reflejos del flash
                         if (area_dado * 0.015) < c_area < (area_dado * 0.15) and 0.4 < c_ar < 2.5:
                             puntos_detectados += 1
                             
                     resultados_tirada.append(puntos_detectados)
-
-                # ===============================================================
-                # PASO 5: REPORTE POR CONSOLA Y CUMPLIMIENTO DEL AVISO
-                # ===============================================================
                 
-                # A. Reporte por consola ordenado
+               
                 tiempo_seg = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                 print(f"\n  TIRADA {tirada_nro}  |  t={tiempo_seg:.2f}s")
                 for i, puntos in enumerate(resultados_tirada):
                     print(f"    Dado {i+1}: {puntos} puntos")
                 print(f"    SUMA TOTAL: {sum(resultados_tirada)}\n")
 
-                # Actualizamos frame_result para que la captura lo muestre con las cajas
                 for idx, dado in enumerate(dados_reposo):
                     x, y, w, h = dado['bbox']
                     cv2.rectangle(frame_result, (x, y), (x+w, y+h), (0, 255, 0), 2)
                     cv2.putText(frame_result, f"D{idx+1}-{resultados_tirada[idx]}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-                # B. Gráfica de Matplotlib (Se muestra 2.5 segs y sigue el video)
                 plt.figure(figsize=(12, 7))
                 plt.suptitle(f"Tirada {tirada_nro} - Suma Total: {sum(resultados_tirada)}", fontsize=16, fontweight='bold')
                 
@@ -218,9 +213,7 @@ for video_path in videos:
         else:
             contador_frames_quietos = 0
             centroides_anteriores = None
-            # No cambiamos el estado acá, para que los recuadros se mantengan hasta que los muevan físicamente.
             
-        # Actualización de estados si se vuelve a tirar un dado en el mismo video
         if estado == 'REPOSO':
             if len(dados_actuales) == 5:
                 centroides_act = np.array([d['centroide'] for d in dados_actuales])
