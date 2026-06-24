@@ -1,3 +1,13 @@
+"""
+Trabajo Práctico III - PDI
+Laureano Diez, Uriel Duvia
+
+Junio 2026
+
+Se requiere detectar qué números surjen de tiradas de dados en distintos videos.
+
+"""
+
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -123,16 +133,19 @@ for video_path in videos:
                 resultados_tirada = []
                 rois_bgr_list = []
                 rois_bin_list = []
-                
+
+                # Escala de grises y ROI
                 for k in range(5):
                     x, y, w, h = dados_reposo[k]['bbox']
                     roi_dado_bgr = frame[y:y+h, x:x+w]
                     roi_dado = frame_gris[y:y+h, x:x+w]
                     
+                    # Tophat
                     k_size = max(3, int(min(w, h) * 0.20)) 
                     kernel_tophat = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
                     roi_tophat = cv2.morphologyEx(roi_dado, cv2.MORPH_TOPHAT, kernel_tophat)
                     
+                    # Otsu
                     _, roi_bin = cv2.threshold(roi_tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                     
                     # Imágenes para el informe
